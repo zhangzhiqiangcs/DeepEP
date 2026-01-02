@@ -1,6 +1,10 @@
 import argparse
 import os
 import time
+import signal
+import sys
+import traceback
+import psutil
 import torch
 import torch.distributed as dist
 
@@ -314,6 +318,45 @@ def test_main(args: argparse.Namespace,
 
 # noinspection PyUnboundLocalVariable,PyShadowingNames
 def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
+    def cleanup_resources():
+        """清理NCCL和其他资源"""
+        try:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+                if local_rank == 0:
+                    print(f"[Rank {local_rank}] NCCL process group destroyed successfully")
+        except Exception as e:
+            if local_rank == 0:
+                print(f"[Rank {local_rank}] Error during cleanup: {e}")
+        
+        # 强制清理CUDA缓存
+        try:
+            torch.cuda.empty_cache()
+            if local_rank == 0:
+                print(f"[Rank {local_rank}] CUDA cache cleared")
+        except Exception as e:
+            if local_rank == 0:
+                print(f"[Rank {local_rank}] Error clearing CUDA cache: {e}")
+        
+        # 强制退出当前进程
+        try:
+            if local_rank == 0:
+                print(f"[Rank {local_rank}] Exiting process")
+            os._exit(0)  # 使用_exit而不是sys.exit来立即终止进程
+        except Exception:
+            pass
+    
+    def signal_handler(signum, frame):
+        """处理中断信号"""
+        if local_rank == 0:
+            print(f"\n[Rank {local_rank}] Received signal {signum}, cleaning up...")
+        cleanup_resources()
+        os._exit(0)  # 使用_exit立即终止，避免清理不彻底
+    
+    # 注册信号处理函数
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     num_nodes = int(os.getenv('WORLD_SIZE', 1))
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
     if args.test_ll_compatibility:
@@ -330,37 +373,48 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                             explicitly_destroy=True)
     assert num_local_ranks == 8 and num_ranks > 8
 
-    for seed in range(int(1e9)):
-        if local_rank == 0:
-            print(f'Testing with seed {seed} ...', flush=True)
-        torch.manual_seed(rank + seed)
-        ref_hash = 0
-        for i in (num_sms, ):
-            ref_hash += test_main(args, i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group,
-                                  args.pressure_test_mode == 1)
+    try:
+        for seed in range(int(1e9)):
             if local_rank == 0:
-                print('', flush=True)
-        if args.pressure_test_mode == 0:
-            break
-
-        if local_rank == 0:
-            print(f'{ref_hash=}')
-            print('', flush=True)
-
-        for _ in range(20):
+                print(f'Testing with seed {seed} ...', flush=True)
             torch.manual_seed(rank + seed)
-            current_hash = 0
+            ref_hash = 0
             for i in (num_sms, ):
-                current_hash += test_main(args, i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group,
-                                          args.pressure_test_mode == 1)
+                ref_hash += test_main(args, i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group,
+                                      args.pressure_test_mode == 1)
                 if local_rank == 0:
                     print('', flush=True)
-            assert current_hash == ref_hash
+            if args.pressure_test_mode == 0:
+                break
 
-    # Test compatibility with low latency functions
-    if args.test_ll_compatibility:
-        buffer.clean_low_latency_buffer(ll_num_tokens, ll_hidden, ll_num_experts)
-        test_low_latency.test_main(ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk, rank, num_ranks, group, buffer, seed=1)
+            if local_rank == 0:
+                print(f'{ref_hash=}')
+                print('', flush=True)
+
+            for _ in range(20):
+                torch.manual_seed(rank + seed)
+                current_hash = 0
+                for i in (num_sms, ):
+                    current_hash += test_main(args, i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group,
+                                              args.pressure_test_mode == 1)
+                    if local_rank == 0:
+                        print('', flush=True)
+                assert current_hash == ref_hash
+
+        # Test compatibility with low latency functions
+        if args.test_ll_compatibility:
+            buffer.clean_low_latency_buffer(ll_num_tokens, ll_hidden, ll_num_experts)
+            test_low_latency.test_main(ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk, rank, num_ranks, group, buffer, seed=1)
+    
+    except Exception as e:
+        if local_rank == 0:
+            print(f"\n[Rank {local_rank}] Error occurred: {e}")
+            traceback.print_exc()
+        raise
+    
+    finally:
+        # 确保清理资源
+        cleanup_resources()
 
     # Destroy the buffer runtime and communication group
     buffer.destroy()
@@ -368,7 +422,42 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     dist.destroy_process_group()
 
 
+def cleanup_all_processes():
+    """清理所有相关的Python进程"""
+    current_process = psutil.Process()
+    children = current_process.children(recursive=True)
+    
+    print(f"[Main Process] Found {len(children)} child processes to clean up")
+    
+    for child in children:
+        try:
+            print(f"[Main Process] Terminating child process {child.pid}")
+            child.terminate()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    
+    # 等待进程结束，如果超时则强制kill
+    gone, alive = psutil.wait_procs(children, timeout=3)
+    for child in alive:
+        try:
+            print(f"[Main Process] Force killing stubborn process {child.pid}")
+            child.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+
+def signal_handler_main(signum, frame):
+    """主进程的信号处理函数"""
+    print(f"\n[Main Process] Received signal {signum}, cleaning up all processes...")
+    cleanup_all_processes()
+    os._exit(0)  # 使用_exit立即终止，避免清理不彻底
+
+
 if __name__ == '__main__':
+    # 注册信号处理函数
+    signal.signal(signal.SIGINT, signal_handler_main)
+    signal.signal(signal.SIGTERM, signal_handler_main)
+    
     parser = argparse.ArgumentParser(description='Test internode EP kernels')
     parser.add_argument('--num-processes', type=int, default=8, help='Number of processes to spawn (default: 8)')
     parser.add_argument('--num-tokens', type=int, default=4096, help='Number of tokens (default: 4096)')
@@ -390,4 +479,29 @@ if __name__ == '__main__':
         args.num_topk_groups = min(num_nodes, 4)
 
     num_processes = args.num_processes
-    torch.multiprocessing.spawn(test_loop, args=(num_processes, args), nprocs=num_processes)
+    
+    try:
+        # 使用spawn的上下文管理器
+        ctx = torch.multiprocessing.start_processes(
+            test_loop, 
+            args=(num_processes, args), 
+            nprocs=num_processes,
+            join=False,
+            start_method='spawn'
+        )
+        
+        # 等待所有进程完成
+        ctx.join()
+        
+    except KeyboardInterrupt:
+        print("\n[Main Process] Interrupted by user, cleaning up...")
+        cleanup_all_processes()
+        
+    except Exception as e:
+        print(f"\n[Main Process] Error occurred: {e}")
+        cleanup_all_processes()
+        raise
+    
+    finally:
+        # 确保清理所有进程
+        cleanup_all_processes()
